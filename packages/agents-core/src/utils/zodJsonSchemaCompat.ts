@@ -1,6 +1,7 @@
 import type { JsonObjectSchema, JsonSchemaDefinitionEntry } from '../types';
 import type { ZodObjectLike } from './zodCompat';
 import { readZodDefinition, readZodType } from './zodCompat';
+import type * as ZodV4 from 'zod/v4';
 
 /**
  * The JSON-schema helpers in openai/helpers/zod only emit complete schemas for
@@ -70,9 +71,286 @@ export function hasJsonSchemaObjectShape(
   );
 }
 
+/**
+ * Recursively finds all unrepresentable types in a Zod schema with their paths.
+ *
+ * Zod 4's native toJSONSchema cannot properly represent certain types (sets, maps,
+ * dates, promises, functions, etc.) and converts them to empty objects {}.
+ * This matches Zod's terminology: toJSONSchema uses `unrepresentable: 'any'` option.
+ *
+ * All of these types have JSON-compatible alternatives that developers should use.
+ *
+ * @param input - A Zod schema (at any nesting level)
+ * @param path - Current path in the schema (for error messages)
+ * @returns Array of { type, path } for all unrepresentable types found
+ */
+function findUnrepresentableTypes(
+  input: unknown,
+  path: string = '$',
+): Array<{ type: string; path: string }> {
+  const found: Array<{ type: string; path: string }> = [];
+
+  function check(value: unknown, currentPath: string): void {
+    if (!value || typeof value !== 'object') {
+      return;
+    }
+
+    const type = readZodType(value);
+    const def = readZodDefinition(value);
+
+    // Types that Zod 4's toJSONSchema marks as 'unrepresentable'
+    // All of these have JSON-compatible alternatives developers should use
+    const unrepresentableTypes = [
+      'set', // Use z.array() instead
+      'map', // Use z.record() instead
+      'date', // Use z.string().datetime() instead
+      'promise', // Remove - promises aren't serializable
+      'function', // Remove - functions aren't serializable
+      'custom', // Use concrete types instead
+      'nan', // Use z.number() instead
+      'undefined', // Use .optional() instead
+      'void', // Use z.null() or remove
+      'symbol', // Use z.string() or z.enum() instead
+    ];
+
+    if (type && unrepresentableTypes.includes(type)) {
+      found.push({ type, path: currentPath });
+      return;
+    }
+
+    switch (type) {
+      case 'object': {
+        const shape = readShape(value);
+        if (shape) {
+          for (const [key, field] of Object.entries(shape)) {
+            check(field, `${currentPath}.${key}`);
+          }
+        }
+        break;
+      }
+
+      case 'array': {
+        const items = def?.element || def?.items || def?.type;
+        if (items) check(items, `${currentPath}[]`);
+        break;
+      }
+
+      case 'tuple': {
+        const items = def?.items || [];
+        const itemsArray = Array.isArray(items) ? items : [items];
+        itemsArray.forEach((item, i) => {
+          check(item, `${currentPath}[${i}]`);
+        });
+        if (def?.rest) check(def.rest, `${currentPath}[...]`);
+        break;
+      }
+
+      case 'union':
+      case 'discriminatedunion': {
+        const options = def?.options || def?.schemas || [];
+        const optionsArray = Array.isArray(options) ? options : [options];
+        optionsArray.forEach((option, i) => {
+          check(option, `${currentPath}<union[${i}]>`);
+        });
+        break;
+      }
+
+      case 'intersection': {
+        if (def?.left) check(def.left, `${currentPath}<left>`);
+        if (def?.right) check(def.right, `${currentPath}<right>`);
+        break;
+      }
+
+      case 'record': {
+        const valueType = def?.valueType || def?.values;
+        if (valueType) check(valueType, `${currentPath}<values>`);
+        const keyType = def?.keyType || def?.keys;
+        if (keyType) check(keyType, `${currentPath}<keys>`);
+        break;
+      }
+
+      case 'nullable':
+      case 'optional': {
+        const inner = def?.innerType || def?.type;
+        if (inner) check(inner, currentPath);
+        break;
+      }
+
+      case 'transform':
+      case 'effects':
+      case 'refinement':
+      case 'pipeline':
+      case 'pipe':
+      case 'brand':
+      case 'branded':
+      case 'catch':
+      case 'default':
+      case 'prefault':
+      case 'readonly': {
+        const underlying =
+          def?.innerType ||
+          def?.schema ||
+          def?.base ||
+          def?.type ||
+          def?.wrapped ||
+          def?.underlying;
+        if (underlying) check(underlying, currentPath);
+        break;
+      }
+
+      case 'lazy': {
+        // Lazy types can't be fully checked without infinite recursion
+        // Conservatively mark as unsupported
+        found.push({ type: 'lazy', path: currentPath });
+        break;
+      }
+    }
+  }
+
+  check(input, path);
+  return found;
+}
+
+/**
+ * Attempts to use Zod 4's native JSON Schema converter.
+ *
+ * This function detects Zod 4 schemas by checking for the `_zod` property.
+ * If the schema contains unrepresentable types (sets, maps, dates, etc.), it throws
+ * a descriptive error telling the developer how to fix their schema.
+ *
+ * All unrepresentable types have JSON-compatible alternatives, so this is always fixable.
+ *
+ * @param input - The Zod schema to convert
+ * @returns JSON Schema object or undefined (for Zod 3, falls back to manual converter)
+ * @throws Error if Zod 4 schema contains unrepresentable types
+ */
+function tryZod4NativeCompat(
+  input: ZodObjectLike,
+): JsonObjectSchema<any> | undefined {
+  try {
+    // Step 1: Check if this is a Zod 4 schema
+    // Zod 4 schemas have a _zod property, Zod 3 schemas have _def
+    const hasZod4Structure = '_zod' in input;
+    if (!hasZod4Structure) {
+      // This is Zod 3 - let manual converter handle it
+      return undefined;
+    }
+
+    // Step 2: Check for unrepresentable types BEFORE attempting conversion
+    const unrepresentableTypes = findUnrepresentableTypes(input);
+
+    if (unrepresentableTypes.length > 0) {
+      // Build a detailed error message with exact fixes for each issue
+      const fixes = unrepresentableTypes
+        .map(({ type, path }) => {
+          switch (type) {
+            case 'set':
+              return `  • ${path}: Replace z.set(T) with z.array(T)
+    Example: z.set(z.string()) → z.array(z.string())
+    If uniqueness matters, add validation: .refine(arr => new Set(arr).size === arr.length, 'Must be unique')`;
+
+            case 'map':
+              return `  • ${path}: Replace z.map() with z.record()
+    Example: z.map(z.string(), z.number()) → z.record(z.string(), z.number())`;
+
+            case 'date':
+              return `  • ${path}: Replace z.date() with z.string().datetime()
+    Example: z.date() → z.string().datetime()
+    Or use z.coerce.date() if you need automatic date parsing from strings`;
+
+            case 'promise':
+              return `  • ${path}: Remove z.promise() - promises cannot be serialized to JSON`;
+
+            case 'function':
+              return `  • ${path}: Remove z.function() - functions cannot be serialized to JSON`;
+
+            case 'symbol':
+              return `  • ${path}: Replace z.symbol() with z.string() or z.enum(['symbol1', 'symbol2'])`;
+
+            case 'undefined':
+              return `  • ${path}: Replace z.undefined() with .optional()
+    Example: field: z.undefined() → field: z.string().optional()`;
+
+            case 'void':
+              return `  • ${path}: Replace z.void() with z.null() or remove the field`;
+
+            case 'nan':
+              return `  • ${path}: Replace z.nan() with z.number()`;
+
+            case 'custom':
+              return `  • ${path}: Replace z.custom() with a concrete type like z.string(), z.number(), or z.object({...})`;
+
+            case 'lazy':
+              return `  • ${path}: Lazy/recursive types may not be fully representable - consider flattening the structure`;
+
+            default:
+              return `  • ${path}: ${type} is not representable in JSON Schema`;
+          }
+        })
+        .join('\n\n');
+
+      throw new Error(
+        `[@openai/agents] Cannot convert Zod 4 schema to JSON Schema.\n\n` +
+          `Found ${unrepresentableTypes.length} unrepresentable type(s):\n\n${fixes}\n\n` +
+          `All of these types have JSON-compatible alternatives. Please update your schema.\n` +
+          `See: https://github.com/anthropics/openai-agents-js/blob/main/docs/zod-schemas.md`,
+      );
+    }
+
+    // Step 3: Load Zod 4 dynamically
+    let z: typeof ZodV4 | undefined;
+    try {
+      try {
+        // accessing project runtime zod version
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        z = require('zod/v4') as typeof ZodV4;
+      } catch {
+        // accessing project runtime zod version
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        z = require('zod') as typeof ZodV4;
+      }
+    } catch (_error) {
+      return undefined;
+    }
+
+    if (!z || typeof z.toJSONSchema !== 'function') {
+      return undefined;
+    }
+
+    // Step 4: Use Zod 4's native converter
+    const jsonSchema = z.toJSONSchema(input, {
+      target: 'draft-7',
+      unrepresentable: 'any',
+      cycles: 'ref',
+      reused: 'inline',
+    });
+
+    // Step 5: Validate the output structure
+    if (!hasJsonSchemaObjectShape(jsonSchema)) {
+      return undefined;
+    }
+
+    return jsonSchema as JsonObjectSchema<any>;
+  } catch (error) {
+    // If it's our descriptive error, rethrow it
+    if (error instanceof Error && error.message.includes('[@openai/agents]')) {
+      throw error;
+    }
+    // Other errors: fall back to manual converter
+    return undefined;
+  }
+}
+
 export function zodJsonSchemaCompat(
   input: ZodObjectLike,
 ): JsonObjectSchema<any> | undefined {
+  // Attempt to use build schema using native conversion function from ZodV4
+  // if found to be installed in the project's runtime environment. If this
+  // fails, fallback to custom schema parsing below
+  const nativeResult = tryZod4NativeCompat(input);
+  if (nativeResult) {
+    return nativeResult;
+  }
   // Attempt to build an object schema from Zod's internal shape. If we cannot
   // understand the structure we return undefined, letting callers raise a
   // descriptive error instead of emitting an invalid schema.
